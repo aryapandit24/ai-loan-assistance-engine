@@ -11,8 +11,16 @@ import os
 import io
 from PIL import Image
 
+# --- NEW: Mindee OCR client ---
+from mindee import Client as MindeeClient, product
+
 load_dotenv()
+
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# --- NEW: Mindee client init ---
+mindee_client = MindeeClient(api_key=os.getenv("MINDEE_API_KEY"))
+
 app = FastAPI()
 
 app.add_middleware(
@@ -25,9 +33,11 @@ app.add_middleware(
 
 database.init_db()
 
+
 class ChatRequest(BaseModel):
     user_id: str
     message: str
+
 
 def get_max_eligibility(income, emi, l_type):
     roi = 0.085 if l_type == "HOME" else 0.12
@@ -38,9 +48,10 @@ def get_max_eligibility(income, emi, l_type):
     max_p = budget / (r * ((1+r)**tenure) / ((1+r)**tenure - 1))
     return round(max_p, 2)
 
+
 def sales_agent_chat(user_data, msg):
     system_instruction = f"""
-    ROLE: Alex, Sales Officer. 
+    ROLE: Alex, Sales Officer.
     CURRENT USER DATA: {user_data}
     LOGIC:
     1. Ask Home/Personal loan.
@@ -59,37 +70,89 @@ def sales_agent_chat(user_data, msg):
     except:
         return {"reply": "I'm processing that. Could you clarify your monthly income?", "extracted_data": {}}
 
+
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
     user = database.get_user(request.user_id) or (database.create_user(request.user_id) or database.get_user(request.user_id))
-    
     ai_res = sales_agent_chat(user, request.message)
     ext = ai_res.get("extracted_data", {})
-    
     updates = {k: v for k, v in ext.items() if v is not None}
     if updates:
         database.update_user_data(request.user_id, **updates)
         user = database.get_user(request.user_id)
-        if user['declared_income'] and user['declared_emi'] and not user['max_eligible']:
-            limit = get_max_eligibility(user['declared_income'], user['declared_emi'], user['loan_type'])
-            database.update_user_data(request.user_id, max_eligible=limit)
-
+    if user['declared_income'] and user['declared_emi'] and not user['max_eligible']:
+        limit = get_max_eligibility(user['declared_income'], user['declared_emi'], user['loan_type'])
+        database.update_user_data(request.user_id, max_eligible=limit)
     return {"reply": ai_res.get('reply', "How can I help further?")}
 
+
 # --- KYC & VERIFICATION LOGIC ---
+
+# --- NEW: Mindee OCR step. Accepts one salary slip at a time, keeps a running
+# average across up to 3 slips, and writes it to verified_income — which is
+# the field check_a in /api/kyc/verify compares declared_income against. ---
+@app.post("/api/kyc/upload-payslip")
+async def upload_payslip(user_id: str, file: UploadFile = File(...)):
+    user = database.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    slips_received = user.get("salary_slip_count") or 0
+    if slips_received >= 3:
+        raise HTTPException(status_code=400, detail="3 salary slips already received.")
+
+    contents = await file.read()
+    tmp_path = f"/tmp/{user_id}_{file.filename}"
+    with open(tmp_path, "wb") as f:
+        f.write(contents)
+
+    try:
+        input_doc = mindee_client.source_from_path(tmp_path)
+        result = mindee_client.parse(product.PayslipV3, input_doc)
+        prediction = result.document.inference.prediction
+        net_salary = prediction.salary_details.net_paid.value
+        if net_salary is None:
+            raise ValueError("Mindee could not read a net salary field from this document.")
+    except Exception:
+        raise HTTPException(status_code=422, detail="Could not extract salary data from this payslip. Please upload a clearer scan.")
+    finally:
+        os.remove(tmp_path)
+
+    slips_received += 1
+    prior_avg = user.get("verified_income") or 0
+    # Running average across however many slips have been processed so far
+    new_avg = ((prior_avg * (slips_received - 1)) + net_salary) / slips_received
+
+    database.update_user_data(
+        user_id,
+        verified_income=round(new_avg, 2),
+        salary_slip_count=slips_received
+    )
+
+    return {
+        "extracted_net_salary": net_salary,
+        "slips_received": slips_received,
+        "running_verified_income_avg": round(new_avg, 2)
+    }
+
+
 @app.post("/api/kyc/verify")
 async def run_verification(user_id: str):
     user = database.get_user(user_id)
+
+    if not user.get("verified_income"):
+        raise HTTPException(status_code=400, detail="No salary slips processed yet. Upload at least one via /api/kyc/upload-payslip first.")
+
     # 5(a) Income Check
     income_err = abs(user['declared_income'] - user['verified_income']) / user['verified_income']
     check_a = "PASSED" if income_err <= 0.10 else "FAILED"
-    
+
     # 5(b) & (c) Mocked for this flow
-    check_b = "PASSED" 
-    check_c = "PASSED" # In production, this would call a CIBIL API
-    
+    check_b = "PASSED"
+    check_c = "PASSED"  # In production, this would call a CIBIL API
+
     results = {"check_a": check_a, "check_b": check_b, "check_c": check_c}
-    
+
     if all(v == "PASSED" for v in results.values()):
         letter_prompt = f"Write a sanction letter for {user_id} for {user['loan_amount']}."
         letter = client.models.generate_content(model='gemini-2.0-flash', contents=[letter_prompt])
@@ -98,6 +161,7 @@ async def run_verification(user_id: str):
     else:
         database.update_user_data(user_id, status="HUMAN_REVIEW", **results)
         return {"status": "FAILED", "reason": "Divergence detected. Officer will call in 2 hours."}
+
 
 @app.get("/api/sanction/{user_id}", response_class=HTMLResponse)
 async def get_letter(user_id: str):
