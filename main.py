@@ -67,7 +67,7 @@ def sales_agent_chat(user_data, msg):
             config=types.GenerateContentConfig(system_instruction=system_instruction, response_mime_type="application/json")
         )
         return json.loads(response.text.replace("```json", "").replace("```", "").strip())
-    except:
+    except Exception as e:
         return {"reply": "I'm processing that. Could you clarify your monthly income?", "extracted_data": {}}
 
 
@@ -113,7 +113,7 @@ async def upload_payslip(user_id: str, file: UploadFile = File(...)):
         net_salary = prediction.salary_details.net_paid.value
         if net_salary is None:
             raise ValueError("Mindee could not read a net salary field from this document.")
-    except Exception:
+    except Exception as e:
         raise HTTPException(status_code=422, detail="Could not extract salary data from this payslip. Please upload a clearer scan.")
     finally:
         os.remove(tmp_path)
